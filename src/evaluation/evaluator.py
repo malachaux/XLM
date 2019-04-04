@@ -256,7 +256,7 @@ class Evaluator(object):
         assert lang1 in params.langs
         assert lang2 in params.langs or lang2 is None
 
-        model = self.model if params.encoder_only else self.encoder
+        model = self.encoder_context if lang1 == 'context' else self.encoder_cand
         model.eval()
         model = model.module if params.multi_gpu else model
 
@@ -309,7 +309,9 @@ class SingleEvaluator(Evaluator):
         Build language model evaluator.
         """
         super().__init__(trainer, data, params)
-        self.model = trainer.model
+        self.encoder_context = trainer.encoder_context
+        self.encoder_cand = trainer.encoder_cand
+
 
 
 class EncDecEvaluator(Evaluator):

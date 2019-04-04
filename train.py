@@ -214,7 +214,8 @@ def main(params):
 
     # build model
     if params.encoder_only:
-        model = build_model(params, data['dico'])
+        encoder_context = build_model(params, data['dico'])
+        encoder_cand = build_model(params, data['dico'])
     else:
         encoder, decoder = build_model(params, data['dico'])
 
@@ -222,7 +223,9 @@ def main(params):
     if params.fp16:
         assert torch.backends.cudnn.enabled
         if params.encoder_only:
-            model = network_to_half(model)
+            encoder_context = network_to_half(encoder_context)
+            encoder_cand = network_to_half(encoder_cand)
+
         else:
             encoder = network_to_half(encoder)
             decoder = network_to_half(decoder)
@@ -232,20 +235,22 @@ def main(params):
         logger.info("Using nn.parallel.DistributedDataParallel ...")
         if params.fp16:
             if params.encoder_only:
-                model = apex.parallel.DistributedDataParallel(model, delay_allreduce=True)
+                encoder_context = apex.parallel.DistributedDataParallel(encoder_context, delay_allreduce=True)
+                encoder_cand = apex.parallel.DistributedDataParallel(encoder_cand, delay_allreduce=True)
             else:
                 encoder = apex.parallel.DistributedDataParallel(encoder, delay_allreduce=True)
                 decoder = apex.parallel.DistributedDataParallel(decoder, delay_allreduce=True)
         else:
             if params.encoder_only:
-                model = nn.parallel.DistributedDataParallel(model, device_ids=[params.local_rank], output_device=params.local_rank, broadcast_buffers=True)
+                encoder_context = nn.parallel.DistributedDataParallel(encoder_context, device_ids=[params.local_rank], output_device=params.local_rank, broadcast_buffers=True)
+                encoder_cand = nn.parallel.DistributedDataParallel(encoder_cand, device_ids=[params.local_rank], output_device=params.local_rank, broadcast_buffers=True)
             else:
                 encoder = nn.parallel.DistributedDataParallel(encoder, device_ids=[params.local_rank], output_device=params.local_rank, broadcast_buffers=True)
                 decoder = nn.parallel.DistributedDataParallel(decoder, device_ids=[params.local_rank], output_device=params.local_rank, broadcast_buffers=True)
 
     # build trainer, reload potential checkpoints / build evaluator
     if params.encoder_only:
-        trainer = SingleTrainer(model, data, params)
+        trainer = SingleTrainer(encoder_context,encoder_cand, data, params)
         evaluator = SingleEvaluator(trainer, data, params)
     else:
         trainer = EncDecTrainer(encoder, decoder, data, params)
@@ -301,6 +306,7 @@ def main(params):
 
         # evaluate perplexity
         scores = evaluator.run_all_evals(trainer)
+        print
 
         # print / JSON log
         for k, v in scores.items():

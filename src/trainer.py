@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 #
-
+import pdb
 import os
 import math
 import time
@@ -100,7 +100,7 @@ class Trainer(object):
         """
         Build optimizer.
         """
-        assert module in ['model', 'encoder', 'decoder']
+        assert module in ['model', 'encoder', 'decoder','encoder_context','encoder_cand']
         optimizer = get_optimizer(getattr(self, module).parameters(), self.params.optimizer)
         if self.params.fp16:
             optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
@@ -442,6 +442,7 @@ class Trainer(object):
         """
         Reload a checkpoint if we find one.
         """
+
         checkpoint_path = os.path.join(self.params.dump_path, 'checkpoint.pth')
         if not os.path.isfile(checkpoint_path):
             return
@@ -551,6 +552,55 @@ class Trainer(object):
         assert x.size(1) % 8 == 0
         return x, lengths, positions, langs, idx
 
+    def round_second_batch(self, x, lengths, positions, langs, idx):
+        """
+        For float16 only.
+        Sub-sample sentences in a batch, and add padding,
+        so that each dimension is a multiple of 8.
+        """
+        params = self.params
+        if not params.fp16 or len(lengths) < 8:
+            return x, lengths, positions, langs
+
+        bs1 = len(lengths)
+        bs2 = 8 * (bs1 // 8)
+        assert bs2 > 0 and bs2 % 8 == 0
+
+        if idx is not None:
+            lengths = lengths[idx]
+            slen = lengths.max().item()
+            x = x[:slen, idx]
+            positions = None if positions is None else positions[:slen, idx]
+            langs = None if langs is None else langs[:slen, idx]
+
+        # sequence length == 0 [8]
+        ml1 = x.size(0)
+        if ml1 % 8 != 0:
+            pad = 8 - (ml1 % 8)
+            ml2 = ml1 + pad
+            x = torch.cat([x, torch.LongTensor(pad, bs2).fill_(params.pad_index)], 0)
+            if positions is not None:
+                positions = torch.cat([positions, torch.arange(pad)[:, None] + positions[-1][None] + 1], 0)
+            if langs is not None:
+                langs = torch.cat([langs, langs[-1][None].expand(pad, bs2)], 0)
+            assert x.size() == (ml2, bs2)
+
+        assert x.size(0) % 8 == 0
+        assert x.size(1) % 8 == 0
+        return x, lengths, positions, langs
+
+
+    def loss_fn(self, ctx, labels, negs=None):
+        """ The classic bi-encoder loss function.
+        """
+        batch_size = ctx.size(0)
+        dot_products = ctx.mm(labels.t())
+        log_prob = F.log_softmax(dot_products, dim=1)
+        targets = log_prob.new_empty(batch_size).long()
+        targets = torch.arange(batch_size, out=targets)
+        loss = F.nll_loss(log_prob, targets.to(log_prob.device))
+        return loss
+
     def clm_step(self, lang1, lang2, lambda_coeff):
         """
         Next word prediction step (causal prediction).
@@ -600,9 +650,13 @@ class Trainer(object):
         if lambda_coeff == 0:
             return
         params = self.params
-        name = 'model' if params.encoder_only else 'encoder'
+        name = 'encoder_context' if lang1 == 'context' else 'encoder_cand'
+        name2 = 'encoder_cand' if lang1 == 'context' else 'encoder_context'
         model = getattr(self, name)
         model.train()
+        model2 = getattr(self, name2)
+        model2.train()
+
 
         # generate batch / select words to predict
         x, lengths, positions, langs, _ = self.generate_batch(lang1, lang2, 'pred')
@@ -611,15 +665,14 @@ class Trainer(object):
 
         # cuda
         x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
-
         # forward / loss
         tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
         _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
         self.stats[('MLM-%s' % lang1) if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss.item())
-        loss = lambda_coeff * loss
+        loss = lambda_coeff * loss + sum([param.sum() for param in model2.parameters()]) * 0
 
         # optimize
-        self.optimize(loss, name)
+        self.optimize(loss, ['encoder_context', 'encoder_cand'])
 
         # number of processed sentences / words
         self.n_sentences += params.batch_size
@@ -634,9 +687,8 @@ class Trainer(object):
         if lambda_coeff == 0:
             return
         params = self.params
-        name = 'model' if params.encoder_only else 'encoder'
-        model = getattr(self, name)
-        model.train()
+        self.encoder_context.train()
+        self.encoder_cand.train()
 
         lang1_id = params.lang2id[lang1]
         lang2_id = params.lang2id[lang2]
@@ -648,53 +700,56 @@ class Trainer(object):
             self.n_sentences += params.batch_size
             return
 
-        # associate lang1 sentences with their translations, and random lang2 sentences
-        y = torch.LongTensor(bs).random_(2)
-        idx_pos = torch.arange(bs)
-        idx_neg = ((idx_pos + torch.LongTensor(bs).random_(1, bs)) % bs)
-        idx = (y == 1).long() * idx_pos + (y == 0).long() * idx_neg
-        x2, len2 = x2[:, idx], len2[idx]
 
-        # generate batch / cuda
-        x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
-        x, lengths, positions, langs, new_idx = self.round_batch(x, lengths, positions, langs)
-        if new_idx is not None:
-            y = y[new_idx]
-        x, lengths, positions, langs = to_cuda(x, lengths, positions, langs)
+        x1, len1, _, _, idx = self.round_batch(x1, len1, None, None)
+        x2, len2, _, _ = self.round_second_batch(x2, len2, None, None, idx)
+
+        x1, len1 = to_cuda(x1, len1)
+        x2, len2 = to_cuda(x2, len2)
+
 
         # get sentence embeddings
-        h = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)[0]
+        h1 = self.encoder_context('fwd', x=x1, lengths=len1, causal=False)[0]
+        h2 = self.encoder_cand('fwd', x=x2, lengths=len2, causal=False)[0]
 
-        # parallel classification loss
-        CLF_ID1, CLF_ID2 = 8, 9  # very hacky, use embeddings to make weights for the classifier
-        emb = (model.module if params.multi_gpu else model).embeddings.weight
-        pred = F.linear(h, emb[CLF_ID1].unsqueeze(0), emb[CLF_ID2, 0])
-        loss = F.binary_cross_entropy_with_logits(pred.view(-1), y.to(pred.device).type_as(pred))
+
+
+
+        # next sentence loss
+        loss = self.loss_fn(h1,h2)
+        s1 = sum([param.sum() for param in self.encoder_context.parameters()]) * 0
+        s2 = sum([param.sum() for param in self.encoder_cand.parameters()]) * 0
+
+
         self.stats['PC-%s-%s' % (lang1, lang2)].append(loss.item())
-        loss = lambda_coeff * loss
+        loss = lambda_coeff * loss + s1 + s2
 
         # optimize
-        self.optimize(loss, name)
+        self.optimize(loss, ['encoder_context', 'encoder_cand'])
 
         # number of processed sentences / words
         self.n_sentences += params.batch_size
         self.stats['processed_s'] += bs
-        self.stats['processed_w'] += lengths.sum().item()
+        self.stats['processed_w'] += 2 * len1.sum().item()
 
 
 class SingleTrainer(Trainer):
 
-    def __init__(self, model, data, params):
+    def __init__(self, encoder_context,encoder_cand, data, params):
 
-        self.MODEL_NAMES = ['model']
+        self.MODEL_NAMES = ['encoder_context', 'encoder_cand']
 
         # model / data / params
-        self.model = model
+        self.encoder_context = encoder_context
+        self.encoder_cand = encoder_cand
         self.data = data
         self.params = params
 
         # optimizers
-        self.optimizers = {'model': self.get_optimizer_fp('model')}
+        self.optimizers = {
+            'encoder_context': self.get_optimizer_fp('encoder_context'),
+            'encoder_cand': self.get_optimizer_fp('encoder_cand'),
+        }
 
         super().__init__(data, params)
 

@@ -273,8 +273,8 @@ class TransformerModel(nn.Module):
         self.position_embeddings = Embedding(N_MAX_POSITIONS, self.dim)
         if params.sinusoidal_embeddings:
             create_sinusoidal_embeddings(N_MAX_POSITIONS, self.dim, out=self.position_embeddings.weight)
-        if params.n_langs > 1:
-            self.lang_embeddings = Embedding(self.n_langs, self.dim)
+        #if params.n_langs > 1:
+        #    self.lang_embeddings = Embedding(self.n_langs, self.dim)
         self.embeddings = Embedding(self.n_words, self.dim, padding_idx=self.pad_index)
         self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
 
@@ -367,8 +367,8 @@ class TransformerModel(nn.Module):
         # embeddings
         tensor = self.embeddings(x)
         tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
-        if langs is not None:
-            tensor = tensor + self.lang_embeddings(langs)
+        #if langs is not None:
+        #    tensor = tensor + self.lang_embeddings(langs)
         tensor = self.layer_norm_emb(tensor)
         tensor = F.dropout(tensor, p=self.dropout, training=self.training)
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)

@@ -172,8 +172,8 @@ class Evaluator(object):
                     self.evaluate_clm(scores, data_set, lang1, lang2)
 
                 # prediction task (evaluate perplexity and accuracy)
-                for lang1, lang2 in params.mlm_steps:
-                    self.evaluate_mlm(scores, data_set, lang1, lang2)
+
+                self.evaluate_mlm(scores, data_set, 'context', None)
 
                 # machine translation task (evaluate perplexity and accuracy)
                 for lang1, lang2 in set(params.mt_steps + [(l2, l3) for _, l2, l3 in params.bt_steps]):
@@ -186,9 +186,9 @@ class Evaluator(object):
                     scores['%s_clm_ppl' % data_set] = np.mean([scores['%s_%s_clm_ppl' % (data_set, lang)] for lang in _clm_mono])
                     scores['%s_clm_acc' % data_set] = np.mean([scores['%s_%s_clm_acc' % (data_set, lang)] for lang in _clm_mono])
                 _mlm_mono = [l1 for (l1, l2) in params.mlm_steps if l2 is None]
-                if len(_mlm_mono) > 0:
-                    scores['%s_mlm_ppl' % data_set] = np.mean([scores['%s_%s_mlm_ppl' % (data_set, lang)] for lang in _mlm_mono])
-                    scores['%s_mlm_acc' % data_set] = np.mean([scores['%s_%s_mlm_acc' % (data_set, lang)] for lang in _mlm_mono])
+                ##if len(_mlm_mono) > 0:
+                ##    scores['%s_mlm_ppl' % data_set] = np.mean([scores['%s_%s_mlm_ppl' % (data_set, lang)] for lang in _mlm_mono])
+                ##    scores['%s_mlm_acc' % data_set] = np.mean([scores['%s_%s_mlm_acc' % (data_set, lang)] for lang in _mlm_mono])
 
         return scores
 
@@ -256,26 +256,31 @@ class Evaluator(object):
         assert lang1 in params.langs
         assert lang2 in params.langs or lang2 is None
 
-        model = self.model if params.encoder_only else self.encoder
-        model.eval()
-        model = model.module if params.multi_gpu else model
+
+        model1 = self.model.encoder_context
+        model1.eval()
+        model1 = model1.module if params.multi_gpu else model1
+
+        model2 = self.model.encoder_cand
+        model2.eval()
+        model2 = model2.module if params.multi_gpu else model2
 
         rng = np.random.RandomState(0)
 
-        lang1_id = params.lang2id[lang1]
-        lang2_id = params.lang2id[lang2] if lang2 is not None else None
+        #lang1_id = params.lang2id[lang1]
+        #lang2_id = params.lang2id[lang2] if lang2 is not None else None
 
         n_words = 0
         xe_loss = 0
         n_valid = 0
 
-        for batch in self.get_iterator(data_set, lang1, lang2, stream=(lang2 is None)):
+        for batch in self.get_iterator(data_set, 'context', lang2, stream=(lang2 is None)):
 
             # batch
             if lang2 is None:
                 x, lengths = batch
                 positions = None
-                langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
+                #langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
             else:
                 (sent1, len1), (sent2, len2) = batch
                 x, lengths, positions, langs = concat_batches(sent1, len1, lang1_id, sent2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=True)
@@ -284,11 +289,37 @@ class Evaluator(object):
             x, y, pred_mask = self.mask_out(x, lengths, rng)
 
             # cuda
-            x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
+            x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
 
             # forward / loss
-            tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
-            word_scores, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
+            tensor = model1('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            word_scores, loss = model1('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
+
+            # update stats
+            n_words += len(y)
+            xe_loss += loss.item() * len(y)
+            n_valid += (word_scores.max(1)[1] == y).sum().item()
+
+        for batch in self.get_iterator(data_set, 'cand', lang2, stream=(lang2 is None)):
+
+            # batch
+            if lang2 is None:
+                x, lengths = batch
+                positions = None
+                #langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
+            else:
+                (sent1, len1), (sent2, len2) = batch
+                x, lengths, positions, langs = concat_batches(sent1, len1, lang1_id, sent2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=True)
+
+            # words to predict
+            x, y, pred_mask = self.mask_out(x, lengths, rng)
+
+            # cuda
+            x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
+
+            # forward / loss
+            tensor = model2('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            word_scores, loss = model2('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
 
             # update stats
             n_words += len(y)
@@ -296,8 +327,8 @@ class Evaluator(object):
             n_valid += (word_scores.max(1)[1] == y).sum().item()
 
         # compute perplexity and prediction accuracy
-        ppl_name = '%s_%s_mlm_ppl' % (data_set, lang1) if lang2 is None else '%s_%s-%s_mlm_ppl' % (data_set, lang1, lang2)
-        acc_name = '%s_%s_mlm_acc' % (data_set, lang1) if lang2 is None else '%s_%s-%s_mlm_acc' % (data_set, lang1, lang2)
+        ppl_name = '%s_%s_mlm_ppl' % (data_set, 'context-cand') if lang2 is None else '%s_%s-%s_mlm_ppl' % (data_set, lang1, lang2)
+        acc_name = '%s_%s_mlm_acc' % (data_set, 'context-cand') if lang2 is None else '%s_%s-%s_mlm_acc' % (data_set, lang1, lang2)
         scores[ppl_name] = np.exp(xe_loss / n_words) if n_words > 0 else 1e9
         scores[acc_name] = 100. * n_valid / n_words if n_words > 0 else 0.
 
@@ -310,6 +341,7 @@ class SingleEvaluator(Evaluator):
         """
         super().__init__(trainer, data, params)
         self.model = trainer.model
+
 
 
 class EncDecEvaluator(Evaluator):

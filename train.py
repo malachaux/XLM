@@ -301,6 +301,7 @@ def main(params):
 
         # evaluate perplexity
         scores = evaluator.run_all_evals(trainer)
+        print
 
         # print / JSON log
         for k, v in scores.items():

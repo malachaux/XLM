@@ -124,6 +124,8 @@ def get_parser():
                         help="Split data across workers of a same node")
     parser.add_argument("--optimizer", type=str, default="adam,lr=0.0001",
                         help="Optimizer (SGD / RMSprop / Adam, etc.)")
+    parser.add_argument("--clip_grad_norm", type=float, default=5,
+                        help="Clip gradients norm (0 to disable)")
     parser.add_argument("--epoch_size", type=int, default=100000,
                         help="Epoch size / evaluation frequency (-1 for parallel data size)")
     parser.add_argument("--max_epoch", type=int, default=100000,
@@ -161,11 +163,13 @@ def get_parser():
     parser.add_argument("--pc_steps", type=str, default="",
                         help="Parallel classification steps")
 
-    # reload a pretrained model
+    # reload pretrained embeddings / pretrained model / checkpoint
     parser.add_argument("--reload_emb", type=str, default="",
                         help="Reload pretrained word embeddings")
     parser.add_argument("--reload_model", type=str, default="",
                         help="Reload a pretrained model")
+    parser.add_argument("--reload_checkpoint", type=str, default="",
+                        help="Reload a checkpoint")
 
     # beam search (for MT only)
     parser.add_argument("--beam_size", type=int, default=1,

@@ -12,7 +12,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pdb
 
 
 N_MAX_POSITIONS = 1024  # maximum input sequence length
@@ -274,8 +273,8 @@ class TransformerModel(nn.Module):
         self.position_embeddings = Embedding(N_MAX_POSITIONS, self.dim)
         if params.sinusoidal_embeddings:
             create_sinusoidal_embeddings(N_MAX_POSITIONS, self.dim, out=self.position_embeddings.weight)
-        #if params.n_langs > 1:
-            #self.lang_embeddings = Embedding(self.n_langs, self.dim)
+        if params.n_langs > 1 and params.model_type == 'transformer':
+            self.lang_embeddings = Embedding(self.n_langs, self.dim)
         self.embeddings = Embedding(self.n_words, self.dim, padding_idx=self.pad_index)
         self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
 
@@ -368,8 +367,8 @@ class TransformerModel(nn.Module):
         # embeddings
         tensor = self.embeddings(x)
         tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
-        #if langs is not None:
-        #    tensor = tensor + self.lang_embeddings(langs)
+        if langs is not None:
+            tensor = tensor + self.lang_embeddings(langs)
         tensor = self.layer_norm_emb(tensor)
         tensor = F.dropout(tensor, p=self.dropout, training=self.training)
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
@@ -736,7 +735,6 @@ class PolyEncoder(nn.Module):
 
     def basic_attention(self, xs, ys, mask_ys=None, dim=2):
 
-        pdb.set_trace()
         bsz = xs.size(0)
         y_len = ys.size(1)
         dtype = xs.dtype
@@ -758,13 +756,12 @@ class PolyEncoder(nn.Module):
     def forward(self, x1, len1, x2, len2 ):
 
         h1, mask = self.encoder_context('fwd', x=x1, lengths=len1, causal=False)
-        h1 = h1.transpose(0,1) # bs x seq_len x 768
+        h1 = h1.transpose(0,1) # bs x seq_len x emb_dim
         h2, _ = self.encoder_cand('fwd', x=x2, lengths=len2, causal=False)
-        h2 = h2[0]
+        h2 = h2[0] # bs x emb_dim
         bs = h1.size(0)
-        cands = h2.repeat(bs,1,1)
-        attention_vecs, _ = self.basic_attention(self.codes.repeat(bs,1,1), h1, mask)  #bs x num_cdes x 768
-        pdb.set_trace()
-        context_cand_emb, _ = self.basic_attention(cands, attention_vecs) #bs x cands x 768
+        cands = h2.repeat(bs,1,1) # bs x bs x emb_dim
+        attention_vecs, _ = self.basic_attention(self.codes.repeat(bs,1,1), h1, mask)  #bs x num_cdes x emb_dim
+        context_cand_emb, _ = self.basic_attention(cands, attention_vecs) #bs x bs x emb_dim
 
         return context_cand_emb, h2

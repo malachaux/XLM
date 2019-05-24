@@ -10,7 +10,7 @@ import os
 import torch
 
 from .pretrain import load_embeddings
-from .transformer import DECODER_ONLY_PARAMS, TransformerModel  # , TRANSFORMER_LAYER_PARAMS
+from .transformer import DECODER_ONLY_PARAMS, TransformerModel, PolyEncoder  # , TRANSFORMER_LAYER_PARAMS
 
 
 logger = getLogger()
@@ -93,7 +93,13 @@ def build_model(params, dico):
     """
     if params.encoder_only:
         # build
-        model = TransformerModel(params, dico, is_encoder=True, with_output=True)
+        assert params.model_type in ['transformer','polyencoder']
+
+        if params.model_type == 'polyencoder':
+            model = PolyEncoder(params, dico, is_encoder=True, with_output=True)
+        elif params.model_type == 'transformer':
+            model = TransformerModel(params, dico, is_encoder=True, with_output=True)
+
 
         # reload pretrained word embeddings
         if params.reload_emb != '':

@@ -9,6 +9,7 @@ import json
 import argparse
 import torch
 from torch import nn
+import pdb
 
 from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
@@ -196,6 +197,8 @@ def get_parser():
                         help="Multi-GPU - Local rank")
     parser.add_argument("--master_port", type=int, default=-1,
                         help="Master port (for multi-node SLURM jobs)")
+    parser.add_argument("--model_type", type=str, default="transformer",
+                        help="Type of model that is trained. 'transformer' or 'polyencoder'")
 
     return parser
 
@@ -216,6 +219,7 @@ def main(params):
 
     # build model
     if params.encoder_only:
+        pdb.set_trace()
         model = build_model(params, data['dico'])
     else:
         encoder, decoder = build_model(params, data['dico'])

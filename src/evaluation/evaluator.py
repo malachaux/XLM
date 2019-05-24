@@ -172,8 +172,13 @@ class Evaluator(object):
                     self.evaluate_clm(scores, data_set, lang1, lang2)
 
                 # prediction task (evaluate perplexity and accuracy)
-
-                self.evaluate_mlm(scores, data_set, 'context', None)
+                if params.model_type == 'transformer':
+                    for lang1, lang2 in params.mlm_steps:
+                        self.evaluate_mlm(scores, data_set, lang1, lang2)
+                elif params.model_type == 'polyencoder':
+                    lang1 = params.mlm_steps[0][0]
+                    lang2 = params.mlm_steps[0][1]
+                    self.evaluate_mlm_poly(scores, data_set, lang1, lang2)
 
                 # machine translation task (evaluate perplexity and accuracy)
                 for lang1, lang2 in set(params.mt_steps + [(l2, l3) for _, l2, l3 in params.bt_steps]):
@@ -233,7 +238,7 @@ class Evaluator(object):
             x, lengths, positions, langs, pred_mask, y = to_cuda(x, lengths, positions, langs, pred_mask, y)
 
             # forward / loss
-            tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=True)
+            tensor,_ = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=True)
             word_scores, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
 
             # update stats
@@ -256,14 +261,64 @@ class Evaluator(object):
         assert lang1 in params.langs
         assert lang2 in params.langs or lang2 is None
 
+        model = self.model if params.encoder_only else self.encoder
+        model.eval()
+        model = model.module if params.multi_gpu else model
 
-        model1 = self.model.encoder_context
-        model1.eval()
-        model1 = model1.module if params.multi_gpu else model1
+        rng = np.random.RandomState(0)
 
-        model2 = self.model.encoder_cand
-        model2.eval()
-        model2 = model2.module if params.multi_gpu else model2
+        lang1_id = params.lang2id[lang1]
+        lang2_id = params.lang2id[lang2] if lang2 is not None else None
+
+        n_words = 0
+        xe_loss = 0
+        n_valid = 0
+
+        for batch in self.get_iterator(data_set, lang1, lang2, stream=(lang2 is None)):
+
+            # batch
+            if lang2 is None:
+                x, lengths = batch
+                positions = None
+                langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
+            else:
+                (sent1, len1), (sent2, len2) = batch
+                x, lengths, positions, langs = concat_batches(sent1, len1, lang1_id, sent2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=True)
+
+            # words to predict
+            x, y, pred_mask = self.mask_out(x, lengths, rng)
+
+            # cuda
+            x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
+
+            # forward / loss
+            tensor,_ = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
+            word_scores, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
+
+            # update stats
+            n_words += len(y)
+            xe_loss += loss.item() * len(y)
+            n_valid += (word_scores.max(1)[1] == y).sum().item()
+
+        # compute perplexity and prediction accuracy
+        ppl_name = '%s_%s_mlm_ppl' % (data_set, lang1) if lang2 is None else '%s_%s-%s_mlm_ppl' % (data_set, lang1, lang2)
+        acc_name = '%s_%s_mlm_acc' % (data_set, lang1) if lang2 is None else '%s_%s-%s_mlm_acc' % (data_set, lang1, lang2)
+        scores[ppl_name] = np.exp(xe_loss / n_words) if n_words > 0 else 1e9
+        scores[acc_name] = 100. * n_valid / n_words if n_words > 0 else 0.
+
+    def evaluate_mlm_poly(self, scores, data_set, lang1, lang2):
+        """
+        Evaluate perplexity and next word prediction accuracy.
+        """
+        params = self.params
+        assert data_set in ['valid', 'test']
+        assert lang1 in params.langs
+        assert lang2 in params.langs or lang2 is None
+
+
+        model = self.model if params.encoder_only else self.encoder
+        model.eval()
+        model = model.module if params.multi_gpu else model
 
         rng = np.random.RandomState(0)
 
@@ -274,52 +329,34 @@ class Evaluator(object):
         xe_loss = 0
         n_valid = 0
 
-        for batch in self.get_iterator(data_set, 'context', lang2, stream=(lang2 is None)):
+        for batch in self.get_iterator(data_set, lang1, None, stream=True):
 
-            # batch
-            if lang2 is None:
-                x, lengths = batch
-                positions = None
-                #langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
-            else:
-                (sent1, len1), (sent2, len2) = batch
-                x, lengths, positions, langs = concat_batches(sent1, len1, lang1_id, sent2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=True)
-
-            # words to predict
+            # batch, word to predict, cuda
+            x, lengths = batch
+            positions = None
             x, y, pred_mask = self.mask_out(x, lengths, rng)
-
-            # cuda
             x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
 
             # forward / loss
-            tensor = model1('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
-            word_scores, loss = model1('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
+            tensor,_ = model.encoder_context('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            word_scores, loss = model.encoder_context('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
 
             # update stats
             n_words += len(y)
             xe_loss += loss.item() * len(y)
             n_valid += (word_scores.max(1)[1] == y).sum().item()
 
-        for batch in self.get_iterator(data_set, 'cand', lang2, stream=(lang2 is None)):
+        for batch in self.get_iterator(data_set, lang2, None, stream=True):
 
-            # batch
-            if lang2 is None:
-                x, lengths = batch
-                positions = None
-                #langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
-            else:
-                (sent1, len1), (sent2, len2) = batch
-                x, lengths, positions, langs = concat_batches(sent1, len1, lang1_id, sent2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=True)
-
-            # words to predict
+            #batch, word to predict, cuda
+            x, lengths = batch
+            positions = None
             x, y, pred_mask = self.mask_out(x, lengths, rng)
-
-            # cuda
             x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
 
             # forward / loss
-            tensor = model2('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
-            word_scores, loss = model2('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
+            tensor,_ = model.encoder_cand('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            word_scores, loss = model.encoder_cand('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
 
             # update stats
             n_words += len(y)
@@ -327,8 +364,8 @@ class Evaluator(object):
             n_valid += (word_scores.max(1)[1] == y).sum().item()
 
         # compute perplexity and prediction accuracy
-        ppl_name = '%s_%s_mlm_ppl' % (data_set, 'context-cand') if lang2 is None else '%s_%s-%s_mlm_ppl' % (data_set, lang1, lang2)
-        acc_name = '%s_%s_mlm_acc' % (data_set, 'context-cand') if lang2 is None else '%s_%s-%s_mlm_acc' % (data_set, lang1, lang2)
+        ppl_name = '%s_%s-%s_mlm_ppl' % (data_set, lang1, lang2)
+        acc_name = '%s_%s-%s_mlm_acc' % (data_set, lang1, lang2)
         scores[ppl_name] = np.exp(xe_loss / n_words) if n_words > 0 else 1e9
         scores[acc_name] = 100. * n_valid / n_words if n_words > 0 else 0.
 
@@ -397,7 +434,7 @@ class EncDecEvaluator(Evaluator):
             x1, len1, langs1, x2, len2, langs2, y = to_cuda(x1, len1, langs1, x2, len2, langs2, y)
 
             # encode source sentence
-            enc1 = encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
+            enc1,_ = encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
             enc1 = enc1.transpose(0, 1)
 
             # decode target sentence

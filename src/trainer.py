@@ -595,6 +595,8 @@ class Trainer(object):
 
 
     def loss_poly(self, context_cand, cand):
+        #context_cand is bs x bs x emb_dim
+        #cand is bs x emb_dim
         bs = context_cand.size(0)
         dim = context_cand.size(2)
 
@@ -636,7 +638,7 @@ class Trainer(object):
         x, lengths, langs, pred_mask, y = to_cuda(x, lengths, langs, pred_mask, y)
 
         # forward / loss
-        tensor = model('fwd', x=x, lengths=lengths, langs=langs, causal=True)
+        tensor, _ = model('fwd', x=x, lengths=lengths, langs=langs, causal=True)
         _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
         self.stats[('CLM-%s' % lang1) if lang2 is None else ('CLM-%s-%s' % (lang1, lang2))].append(loss.item())
         loss = lambda_coeff * loss
@@ -658,36 +660,59 @@ class Trainer(object):
         if lambda_coeff == 0:
             return
         params = self.params
-        self.model.train()
+        name = 'model' if params.encoder_only else 'encoder'
+        model = getattr(self, name)
+        model.train()
 
 
-        # generate batch / select words to predict
-        x, lengths, positions, langs, _ = self.generate_batch('context', lang2, 'pred')
-        #x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
-        x, y, pred_mask = self.mask_out(x, lengths)
+        if params.model_type == "transformer":
+                # generate batch / select words to predict
+                x, lengths, positions, langs, _ = self.generate_batch(lang1, lang2, 'pred')
+                x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
+                x, y, pred_mask = self.mask_out(x, lengths)
 
-        # cuda
-        x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
-        # forward / loss
-        tensor, _ = self.model.encoder_context('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
-        _, loss_context = self.model.encoder_context('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('MLM-%s' % 'context') if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss_context.item())
+                # cuda
+                x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
 
-        # generate batch / select words to predict
-        x, lengths, positions, langs, _ = self.generate_batch('cand', lang2, 'pred')
-        #x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
-        x, y, pred_mask = self.mask_out(x, lengths)
+                # forward / loss
+                tensor, _ = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
+                _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+                self.stats[('MLM-%s' % lang1) if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss.item())
+                loss = lambda_coeff * loss
 
-        # cuda
-        x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
-        # forward / loss
-        tensor,_ = self.model.encoder_cand('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
-        _, loss_cand = self.model.encoder_cand('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('MLM-%s' % 'cand') if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss_cand.item())
+        if params.model_type == "polyencoder":
 
-        s = sum([param.sum() for param in self.model.parameters()]) * 0
+            assert len(params.mlm_steps) == 2
+            for langs in params.mlm_steps:
+                assert langs[1] is None
 
-        loss = lambda_coeff * (loss_context + loss_cand + s)
+            # MLM on the context_encoder with the context data
+            lang_context =   params.mlm_steps[0][0]
+            # generate batch / select words to predict
+            x, lengths, positions, _, _ = self.generate_batch(lang_context, None, 'pred')
+            x, y, pred_mask = self.mask_out(x, lengths)
+            x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
+            # forward / loss
+            tensor, _ = self.model.encoder_context('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            _, loss_context = self.model.encoder_context('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+            self.stats[('MLM-%s' % lang_context)].append(loss_context.item())
+
+            # MLM on the cand_encoder with the candidate data
+            lang_cand =   params.mlm_steps[1][0]
+            # generate batch / select words to predict
+            x, lengths, positions, _, _ = self.generate_batch(lang_cand, None, 'pred')
+            x, y, pred_mask = self.mask_out(x, lengths)
+            x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
+            # forward / loss
+            tensor,_ = self.model.encoder_cand('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            _, loss_cand = self.model.encoder_cand('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+            self.stats[('MLM-%s' % lang_cand)].append(loss_cand.item())
+
+            # have to add the parameters not used (codes of the poly-encoder) to make it work on multi-machine
+            s = sum([param.sum() for param in self.model.parameters()]) * 0
+            loss = loss_context + loss_cand + s
+
+        loss = lambda_coeff * loss
         # optimize
         self.optimize(loss, 'model')
 
@@ -704,7 +729,9 @@ class Trainer(object):
         if lambda_coeff == 0:
             return
         params = self.params
-        self.model.train()
+        name = 'model' if params.encoder_only else 'encoder'
+        model = getattr(self, name)
+        model.train()
 
         lang1_id = params.lang2id[lang1]
         lang2_id = params.lang2id[lang2]
@@ -717,26 +744,54 @@ class Trainer(object):
             return
 
 
-        x1, len1, _, _, idx = self.round_batch(x1, len1, None, None)
-        x2, len2, _, _ = self.round_second_batch(x2, len2, None, None, idx)
+        if params.model_type == 'transformer':
 
-        x1, len1 = to_cuda(x1, len1)
-        x2, len2 = to_cuda(x2, len2)
+            # associate lang1 sentences with their translations, and random lang2 sentences
+            y = torch.LongTensor(bs).random_(2)
+            idx_pos = torch.arange(bs)
+            idx_neg = ((idx_pos + torch.LongTensor(bs).random_(1, bs)) % bs)
+            idx = (y == 1).long() * idx_pos + (y == 0).long() * idx_neg
+            x2, len2 = x2[:, idx], len2[idx]
+
+            # generate batch / cuda
+            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
+            x, lengths, positions, langs, new_idx = self.round_batch(x, lengths, positions, langs)
+            if new_idx is not None:
+                y = y[new_idx]
+            x, lengths, positions, langs = to_cuda(x, lengths, positions, langs)
+
+            # get sentence embeddings
+            h, _ = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
+            h = h[0]
+
+            # parallel classification loss
+            CLF_ID1, CLF_ID2 = 8, 9  # very hacky, use embeddings to make weights for the classifier
+            emb = (model.module if params.multi_gpu else model).embeddings.weight
+            pred = F.linear(h, emb[CLF_ID1].unsqueeze(0), emb[CLF_ID2, 0])
+            loss = F.binary_cross_entropy_with_logits(pred.view(-1), y.to(pred.device).type_as(pred))
+
+        if params.model_type == 'polyencoder':
+
+            x1, len1, _, _, idx = self.round_batch(x1, len1, None, None)
+            x2, len2, _, _ = self.round_second_batch(x2, len2, None, None, idx)
+
+            x1, len1 = to_cuda(x1, len1)
+            x2, len2 = to_cuda(x2, len2)
 
 
-        # get sentence embeddings
-        context_cand_emb, cand = self.model(x1, len1, x2, len2)
+            # get sentence embeddings
+            #context_cand_emb is bs x bs x emb_dim
+            # cand is bs x emb_dim
+            context_cand_emb, cand = self.model(x1, len1, x2, len2)
 
-
-
-        # next sentence loss
-        loss = self.loss_poly(context_cand_emb,cand)
-
-        s = sum([param.sum() for param in self.model.parameters()]) * 0
+            # next sentence loss
+            loss = self.loss_poly(context_cand_emb,cand)
+            s = sum([param.sum() for param in self.model.parameters()]) * 0
+            loss = s + loss
 
 
         self.stats['PC-%s-%s' % (lang1, lang2)].append(loss.item())
-        loss = lambda_coeff * loss + s
+        loss = lambda_coeff * loss
 
         # optimize
         self.optimize(loss, ['model'])

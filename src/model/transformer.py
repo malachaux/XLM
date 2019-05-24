@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-N_MAX_POSITIONS = 512  # maximum input sequence length
+N_MAX_POSITIONS = 1024  # maximum input sequence length
 
 DECODER_ONLY_PARAMS = [
     'layer_norm15.%i.weight', 'layer_norm15.%i.bias',
@@ -273,7 +273,7 @@ class TransformerModel(nn.Module):
         self.position_embeddings = Embedding(N_MAX_POSITIONS, self.dim)
         if params.sinusoidal_embeddings:
             create_sinusoidal_embeddings(N_MAX_POSITIONS, self.dim, out=self.position_embeddings.weight)
-        if params.n_langs > 1:
+        if params.n_langs > 1 and params.model_type == 'transformer':
             self.lang_embeddings = Embedding(self.n_langs, self.dim)
         self.embeddings = Embedding(self.n_words, self.dim, padding_idx=self.pad_index)
         self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
@@ -401,7 +401,7 @@ class TransformerModel(nn.Module):
         # move back sequence length to dimension 0
         tensor = tensor.transpose(0, 1)
 
-        return tensor
+        return tensor, mask
 
     def predict(self, tensor, pred_mask, y, get_scores):
         """
@@ -722,3 +722,47 @@ class BeamHypotheses(object):
             return True
         else:
             return self.worst_score >= best_sum_logprobs / self.max_len ** self.length_penalty
+
+
+class PolyEncoder(nn.Module):
+
+    def __init__(self, params, dico, is_encoder, with_output):
+        super().__init__()
+        self.encoder_context = TransformerModel(params, dico, is_encoder, with_output)
+        self.encoder_cand = TransformerModel(params, dico, is_encoder, with_output)
+
+        codes = torch.ones(16,params.emb_dim)
+        self.codes = torch.nn.Parameter(codes)
+
+    def basic_attention(self, xs, ys, mask_ys=None, dim=2):
+
+        bsz = xs.size(0)
+        y_len = ys.size(1)
+        dtype = xs.dtype
+        num_attention = xs.size(1)
+        l1 = torch.bmm(xs, ys.transpose(1, 2))
+        if mask_ys is not None:
+            attn_mask = (mask_ys == 0).view(bsz, 1, y_len)
+            attn_mask = attn_mask.repeat(1,num_attention,1)
+            # assert attn_mask.shape == l1.shape
+            l1.masked_fill_(attn_mask, -65504)
+
+        weight = F.softmax(l1, dim=dim)
+
+        emb = torch.bmm(weight, ys)
+        return emb, weight
+
+
+
+    def forward(self, x1, len1, x2, len2 ):
+
+        h1, mask = self.encoder_context('fwd', x=x1, lengths=len1, causal=False)
+        h1 = h1.transpose(0,1) # bs x seq_len x emb_dim
+        h2, _ = self.encoder_cand('fwd', x=x2, lengths=len2, causal=False)
+        h2 = h2[0] # bs x emb_dim
+        bs = h1.size(0)
+        cands = h2.repeat(bs,1,1) # bs x bs x emb_dim
+        attention_vecs, _ = self.basic_attention(self.codes.repeat(bs,1,1), h1, mask)  #bs x num_cdes x emb_dim
+        context_cand_emb, _ = self.basic_attention(cands, attention_vecs) #bs x bs x emb_dim
+
+        return context_cand_emb, h2

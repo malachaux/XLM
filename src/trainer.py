@@ -556,6 +556,57 @@ class Trainer(object):
         assert x.size(1) % 8 == 0
         return x, lengths, positions, langs, idx
 
+    def round_second_batch(self, x, lengths, positions, langs, idx):
+        """
+        For float16 only.
+        Sub-sample sentences in a batch, and add padding,
+        so that each dimension is a multiple of 8.
+        """
+        params = self.params
+        if not params.fp16 or len(lengths) < 8:
+            return x, lengths, positions, langs
+
+        bs1 = len(lengths)
+        bs2 = 8 * (bs1 // 8)
+        assert bs2 > 0 and bs2 % 8 == 0
+
+        if idx is not None:
+            lengths = lengths[idx]
+            slen = lengths.max().item()
+            x = x[:slen, idx]
+            positions = None if positions is None else positions[:slen, idx]
+            langs = None if langs is None else langs[:slen, idx]
+
+        # sequence length == 0 [8]
+        ml1 = x.size(0)
+        if ml1 % 8 != 0:
+            pad = 8 - (ml1 % 8)
+            ml2 = ml1 + pad
+            x = torch.cat([x, torch.LongTensor(pad, bs2).fill_(params.pad_index)], 0)
+            if positions is not None:
+                positions = torch.cat([positions, torch.arange(pad)[:, None] + positions[-1][None] + 1], 0)
+            if langs is not None:
+                langs = torch.cat([langs, langs[-1][None].expand(pad, bs2)], 0)
+            assert x.size() == (ml2, bs2)
+
+        assert x.size(0) % 8 == 0
+        assert x.size(1) % 8 == 0
+        return x, lengths, positions, langs
+
+    def loss_poly(self, context_cand, cand):
+        bs = context_cand.size(0)
+        dim = context_cand.size(2)
+
+        context_cand = context_cand.reshape(bs*bs,-1)
+        cand = cand.repeat(bs,1)
+        scores = torch.bmm(context_cand.reshape(bs*bs,1,dim), cand.reshape(bs*bs,dim,1)).reshape(bs,bs)
+
+        targets = scores.new_empty(bs).long()
+        targets = torch.arange(bs, out=targets)
+
+        loss = F.cross_entropy(scores, targets.to(scores.device))
+        return loss
+
     def clm_step(self, lang1, lang2, lambda_coeff):
         """
         Next word prediction step (causal prediction).
@@ -583,7 +634,7 @@ class Trainer(object):
         x, lengths, langs, pred_mask, y = to_cuda(x, lengths, langs, pred_mask, y)
 
         # forward / loss
-        tensor = model('fwd', x=x, lengths=lengths, langs=langs, causal=True)
+        tensor, _ = model('fwd', x=x, lengths=lengths, langs=langs, causal=True)
         _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
         self.stats[('CLM-%s' % lang1) if lang2 is None else ('CLM-%s-%s' % (lang1, lang2))].append(loss.item())
         loss = lambda_coeff * loss
@@ -609,22 +660,57 @@ class Trainer(object):
         model = getattr(self, name)
         model.train()
 
-        # generate batch / select words to predict
-        x, lengths, positions, langs, _ = self.generate_batch(lang1, lang2, 'pred')
-        x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
-        x, y, pred_mask = self.mask_out(x, lengths)
 
-        # cuda
-        x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
+        if params.model_type == "transformer":
+                # generate batch / select words to predict
+                x, lengths, positions, langs, _ = self.generate_batch(lang1, lang2, 'pred')
+                x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
+                x, y, pred_mask = self.mask_out(x, lengths)
 
-        # forward / loss
-        tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
-        _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('MLM-%s' % lang1) if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss.item())
+                # cuda
+                x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
+
+                # forward / loss
+                tensor, _ = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
+                _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+                self.stats[('MLM-%s' % lang1) if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss.item())
+                loss = lambda_coeff * loss
+
+        if params.model_type == "polyencoder":
+
+            assert len(params.mlm_steps) == 2
+            for langs in params.mlm_steps:
+                assert langs[1] is None
+
+            # MLM on the context_encoder with the context data
+            lang_context =   params.mlm_steps[0][0]
+            # generate batch / select words to predict
+            x, lengths, positions, _, _ = self.generate_batch(lang_context, None, 'pred')
+            x, y, pred_mask = self.mask_out(x, lengths)
+            x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
+            # forward / loss
+            tensor, _ = self.model.encoder_context('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            _, loss_context = self.model.encoder_context('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+            self.stats[('MLM-%s' % lang_context)].append(loss_context.item())
+
+            # MLM on the cand_encoder with the candidate data
+            lang_cand =   params.mlm_steps[1][0]
+            # generate batch / select words to predict
+            x, lengths, positions, _, _ = self.generate_batch(lang_cand, None, 'pred')
+            x, y, pred_mask = self.mask_out(x, lengths)
+            x, y, pred_mask, lengths, positions = to_cuda(x, y, pred_mask, lengths, positions)
+            # forward / loss
+            tensor,_ = self.model.encoder_cand('fwd', x=x, lengths=lengths, positions=positions, langs=None, causal=False)
+            _, loss_cand = self.model.encoder_cand('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+            self.stats[('MLM-%s' % lang_cand)].append(loss_cand.item())
+
+            # have to add the parameters not used (codes of the poly-encoder) to make it work on multi-machine
+            s = sum([param.sum() for param in self.model.parameters()]) * 0
+            loss = loss_context + loss_cand + s
+
         loss = lambda_coeff * loss
-
         # optimize
-        self.optimize(loss, name)
+        self.optimize(loss, 'model')
 
         # number of processed sentences / words
         self.n_sentences += params.batch_size
@@ -653,38 +739,61 @@ class Trainer(object):
             self.n_sentences += params.batch_size
             return
 
-        # associate lang1 sentences with their translations, and random lang2 sentences
-        y = torch.LongTensor(bs).random_(2)
-        idx_pos = torch.arange(bs)
-        idx_neg = ((idx_pos + torch.LongTensor(bs).random_(1, bs)) % bs)
-        idx = (y == 1).long() * idx_pos + (y == 0).long() * idx_neg
-        x2, len2 = x2[:, idx], len2[idx]
 
-        # generate batch / cuda
-        x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
-        x, lengths, positions, langs, new_idx = self.round_batch(x, lengths, positions, langs)
-        if new_idx is not None:
-            y = y[new_idx]
-        x, lengths, positions, langs = to_cuda(x, lengths, positions, langs)
+        if params.model_type == 'transformer':
 
-        # get sentence embeddings
-        h = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)[0]
+            # associate lang1 sentences with their translations, and random lang2 sentences
+            y = torch.LongTensor(bs).random_(2)
+            idx_pos = torch.arange(bs)
+            idx_neg = ((idx_pos + torch.LongTensor(bs).random_(1, bs)) % bs)
+            idx = (y == 1).long() * idx_pos + (y == 0).long() * idx_neg
+            x2, len2 = x2[:, idx], len2[idx]
 
-        # parallel classification loss
-        CLF_ID1, CLF_ID2 = 8, 9  # very hacky, use embeddings to make weights for the classifier
-        emb = (model.module if params.multi_gpu else model).embeddings.weight
-        pred = F.linear(h, emb[CLF_ID1].unsqueeze(0), emb[CLF_ID2, 0])
-        loss = F.binary_cross_entropy_with_logits(pred.view(-1), y.to(pred.device).type_as(pred))
+            # generate batch / cuda
+            x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
+            x, lengths, positions, langs, new_idx = self.round_batch(x, lengths, positions, langs)
+            if new_idx is not None:
+                y = y[new_idx]
+            x, lengths, positions, langs = to_cuda(x, lengths, positions, langs)
+
+            # get sentence embeddings
+            h, _ = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
+            h = h[0]
+
+            # parallel classification loss
+            CLF_ID1, CLF_ID2 = 8, 9  # very hacky, use embeddings to make weights for the classifier
+            emb = (model.module if params.multi_gpu else model).embeddings.weight
+            pred = F.linear(h, emb[CLF_ID1].unsqueeze(0), emb[CLF_ID2, 0])
+            loss = F.binary_cross_entropy_with_logits(pred.view(-1), y.to(pred.device).type_as(pred))
+
+        if params.model_type == 'polyencoder':
+
+            x1, len1, _, _, idx = self.round_batch(x1, len1, None, None)
+            x2, len2, _, _ = self.round_second_batch(x2, len2, None, None, idx)
+            x1, len1 = to_cuda(x1, len1)
+            x2, len2 = to_cuda(x2, len2)
+
+            # get sentence embeddings
+            #context_cand_emb is bs x bs x emb_dim
+            # cand is bs x emb_dim
+            context_cand_emb, cand = self.model(x1, len1, x2, len2)
+
+            # next sentence loss
+            loss = self.loss_poly(context_cand_emb,cand)
+            s = sum([param.sum() for param in self.model.parameters()]) * 0
+            loss = s + loss
+
+
         self.stats['PC-%s-%s' % (lang1, lang2)].append(loss.item())
         loss = lambda_coeff * loss
 
         # optimize
-        self.optimize(loss, name)
+        self.optimize(loss, ['model'])
 
         # number of processed sentences / words
         self.n_sentences += params.batch_size
         self.stats['processed_s'] += bs
-        self.stats['processed_w'] += lengths.sum().item()
+        self.stats['processed_w'] += 2 * len1.sum().item()
 
 
 class SingleTrainer(Trainer):
@@ -759,7 +868,7 @@ class EncDecTrainer(Trainer):
         x1, len1, langs1, x2, len2, langs2, y = to_cuda(x1, len1, langs1, x2, len2, langs2, y)
 
         # encode source sentence
-        enc1 = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
+        enc1, _ = self.encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
         enc1 = enc1.transpose(0, 1)
 
         # decode target sentence
@@ -808,7 +917,7 @@ class EncDecTrainer(Trainer):
             self.decoder.eval()
 
             # encode source sentence and translate it
-            enc1 = _encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
+            enc1, _ = _encoder('fwd', x=x1, lengths=len1, langs=langs1, causal=False)
             enc1 = enc1.transpose(0, 1)
             x2, len2 = _decoder.generate(enc1, len1, lang2_id, max_len=int(1.3 * len1.max().item() + 5))
             langs2 = x2.clone().fill_(lang2_id)
@@ -821,7 +930,7 @@ class EncDecTrainer(Trainer):
             self.decoder.train()
 
         # encode generate sentence
-        enc2 = self.encoder('fwd', x=x2, lengths=len2, langs=langs2, causal=False)
+        enc2, _ = self.encoder('fwd', x=x2, lengths=len2, langs=langs2, causal=False)
         enc2 = enc2.transpose(0, 1)
 
         # words to predict

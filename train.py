@@ -197,6 +197,10 @@ def get_parser():
     parser.add_argument("--master_port", type=int, default=-1,
                         help="Master port (for multi-node SLURM jobs)")
 
+    #model type
+    parser.add_argument("--model_type", type=str, default='transformer',
+                        help="Choice of model, transformer or polyencoder")
+
     return parser
 
 

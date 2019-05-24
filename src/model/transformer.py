@@ -737,6 +737,7 @@ class PolyEncoder(nn.Module):
     def basic_attention(self, xs, ys, mask_ys=None, dim=2):
 
         bsz = xs.size(0)
+        emb_dim = ys.size(2)
         y_len = ys.size(1)
         dtype = xs.dtype
         num_attention = xs.size(1)
@@ -748,6 +749,7 @@ class PolyEncoder(nn.Module):
             l1.masked_fill_(attn_mask, -65504)
 
         weight = F.softmax(l1, dim=dim)
+        weight = weight / math.sqrt(emb_dim)
 
         emb = torch.bmm(weight, ys)
         return emb, weight

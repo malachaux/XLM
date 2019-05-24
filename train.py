@@ -9,7 +9,6 @@ import json
 import argparse
 import torch
 from torch import nn
-import pdb
 
 from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
@@ -217,7 +216,6 @@ def main(params):
 
     # build model
     if params.encoder_only:
-        pdb.set_trace()
         model = build_model(params, data['dico'])
     else:
         encoder, decoder = build_model(params, data['dico'])
